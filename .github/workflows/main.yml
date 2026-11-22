@@ -1,0 +1,172 @@
+name: twreg-public-allinone
+
+# 放在【公开仓库】里跑的入口 —— 全自动出口链版（allinone 分支）
+#
+# 出口顺序：VPNGate → UR → WARP → 直连，全部失败才结束。
+# 只需要填 4 个参数：runner 数 / 每 runner 线程数 / 每线程账号数 / 是否上传（默认开）。
+#
+# 公开仓库配置：
+#   Variables: PRIVATE_REPO_ACCESS_KEY（读私有仓库的 PAT）、API_BASE_URL（前端 IP，可选）
+#   Secrets  : API_TOKEN（上传接口令牌，可选）、artifact_pass（加密账号，建议）
+on:
+  workflow_dispatch:
+    inputs:
+      runners:
+        description: "runner 数量（每个 runner 一个 job，推荐 256）"
+        required: false
+        default: "1"
+      workers:
+        description: "每个 runner 的线程数"
+        required: false
+        default: "3"
+      accounts:
+        description: "每个线程注册账号数"
+        required: false
+        default: "15"
+      upload:
+        description: "上传账号到服务器: 1=上传 0=只加密上传 artifact"
+        required: false
+        default: "1"
+
+concurrency:
+  group: twreg-public-allinone-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.m.outputs.matrix }}
+    steps:
+      - id: m
+        env:
+          N: ${{ inputs.runners }}
+        run: |
+          M=$(python3 -c "import json,os;n=max(1,min(256,int(os.environ.get('N') or 1)));print(json.dumps(list(range(n))))")
+          echo "matrix=$M" >> "$GITHUB_OUTPUT"
+
+  reg:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        run: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+      LOG_MASK: "1"
+    steps:
+      - name: 检出私有仓库代码
+        uses: actions/checkout@v4
+        with:
+          repository: xbox-cn/twreg_ruyijs
+          ref: allinone
+          token: ${{ secrets.PRIVATE_REPO_ACCESS_KEY || vars.PRIVATE_REPO_ACCESS_KEY }}
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install "ruyijs>=0.4.1"
+          python -c "import ruyijs; print('ruyijs', ruyijs.__version__)"
+
+      - name: 安装 OpenVPN（VPNGate）
+        shell: pwsh
+        run: |
+          $exe = 'C:/Program Files/OpenVPN/bin/openvpn.exe'
+          if (Test-Path $exe) { Write-Host "openvpn already installed"; exit 0 }
+          choco install openvpn --no-progress -y
+          if (-not (Test-Path $exe)) { Write-Host "::warning::openvpn 安装失败，VPNGate 将跳过" }
+
+      - name: 下载预编译 ur-socks
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.PRIVATE_REPO_ACCESS_KEY || vars.PRIVATE_REPO_ACCESS_KEY }}
+        run: |
+          gh release download ur-socks --repo xbox-cn/twreg_ruyijs --pattern ur-socks.exe --output ur-socks.exe --clobber
+          ls -lh ur-socks.exe
+
+      - name: 建立出口链并注册（必须同一 step）
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALLINONE: "1"
+          ALLINONE_ORDER: "vpngate,ur,warp,direct"
+          EGRESS_ROTATE_AFTER: "2"
+          PROXY_SERVER: direct
+          VPNGATE_ENABLED: "1"
+          VPNGATE_OPENVPN: 'C:/Program Files/OpenVPN/bin/openvpn.exe'
+          VPNGATE_NODES: "100"
+          VPNGATE_ATTEMPTS: "2"
+          VPNGATE_ROTATE_ATTEMPTS: "2"
+          VPNGATE_TIMEOUT: "25"
+          VPNGATE_MIN_NODES: "5"
+          VPNGATE_FETCH_ROUNDS: "2"
+          VPNGATE_MIN_VALID: "2"
+          VPNGATE_VALIDATE_MAX: "3"
+          VPNGATE_POOL_ROUNDS: "2"
+          VPNGATE_REFRESH_ROUNDS: "1"
+          UR_INSTANCES: "1"
+          UR_AUTO_ACCOUNTS: "1"
+          UR_PROBE: "1"
+          UR_PROBE_RETRIES: "2"
+          UR_BASE_PORT: "9001"
+          WARP_CORE: "awg"
+          WARP_PORT: "7890"
+          WARP_READY_TIMEOUT: "30"
+          WORKERS: ${{ inputs.workers }}
+          ACCOUNTS: ${{ inputs.accounts }}
+          MAIL_API_URL: ${{ vars.MAIL_API_URL || 'https://mail.minecraft.fashion' }}
+          MAIL_DOMAINS: "*.jsip.us"
+          ENABLE_UPLOAD: ${{ inputs.upload }}
+          API_BASE_URL: ${{ vars.API_BASE_URL || secrets.API_BASE_URL || 'http://192.255.172.250:5000' }}
+          API_TOKEN: ${{ secrets.API_TOKEN || vars.API_TOKEN }}
+        run: |
+          python warmup.py
+          python run_ruyi.py
+
+      - name: 断开 VPNGate
+        if: always()
+        shell: pwsh
+        run: python vpngate.py --down
+
+      - name: 加密账号目录
+        if: always()
+        shell: bash
+        env:
+          ARTIFACT_PASS: ${{ secrets.artifact_pass }}
+        run: |
+          if [ -d accounts ] && [ -n "$(ls -A accounts 2>/dev/null)" ]; then
+            if [ -n "$ARTIFACT_PASS" ]; then
+              tar -czf accounts.tar.gz accounts logs 2>/dev/null || tar -czf accounts.tar.gz accounts
+              openssl enc -aes-256-cbc -pbkdf2 -salt -in accounts.tar.gz -out accounts.tar.gz.enc -pass "pass:$ARTIFACT_PASS"
+              rm -f accounts.tar.gz
+              echo "encrypted: accounts.tar.gz.enc"
+            else
+              echo "::warning::未配置 artifact_pass，账号不会上传（避免公开泄露）"
+            fi
+          else
+            echo "no accounts produced"
+          fi
+
+      - name: 上传加密产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allinone-accounts-run${{ matrix.run }}-${{ github.run_id }}
+          path: |
+            accounts.tar.gz.enc
+            logs/
+            vpngate-data/openvpn.log
+            ur-socks-*.log
+            ur_accounts.jsonl
+          retention-days: 14
+          if-no-files-found: warn
